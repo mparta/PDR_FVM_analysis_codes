@@ -1,0 +1,297 @@
+### Imports
+
+```{r}
+library("stringr")
+library("DESeq2")
+library("EnsDb.Hsapiens.v86")
+library("dplyr")
+library("ggplot2")
+library("ggrepel")
+library("ggpubr")
+library("writexl")
+```
+
+```{r}
+date_str <- format(Sys.Date(), "%Y%m%d")
+date_str
+
+set.seed(42)
+```
+
+
+### Annotation file for samples
+```{r}
+annot_table <- read.table("../GSE102485_series_matrix.txt",
+                          sep = "\t", fill = TRUE, skip = 30, header = TRUE)
+```
+
+
+```{r}
+# Build a more focused annotation title with sample name, source, disease and tissue
+sample_annot <- data.frame("title" = colnames(annot_table)[2:31])
+sample_annot["source"] <- unlist(annot_table[7, 2:31])
+sample_annot["disease"] <- unlist(annot_table[9, 2:31])
+sample_annot["tissue"] <- unlist(annot_table[10, 2:31])
+```
+
+```{r}
+# Keep only samples that are from normal retinas or diabetes membranes
+uninteresting_samples <- sample_annot$title %in% c("Bp2", "Bp3", "Bp4", "IIr1", "IIr2", "Rp1", "Rp2")
+sample_annot <- sample_annot[!uninteresting_samples, ]
+sample_annot["group"] <- ifelse(sample_annot$source == "retina", "Normal", "Disease")
+
+rownames(sample_annot) <- sample_annot$title
+
+sample_annot$source <- factor(sample_annot$source)
+sample_annot$tissue <- factor(sample_annot$tissue)
+sample_annot$disease <- factor(sample_annot$disease)
+sample_annot$group <- factor(sample_annot$group)
+```
+
+### Process the dataset
+
+```{r}
+full_count_table <- read.table("../GSE102485_expressed_gene_reads.txt", sep = "\t", header = TRUE, fill = TRUE, quote = "")
+
+# Drop columns that don't seem to have a clear meaning
+trimmed_count_table <- full_count_table[, c(1:37)]
+
+counts <- trimmed_count_table[, c(1:31)]
+rownames(counts) <- counts$Gene
+counts[, 1] <- NULL
+
+rownames(counts) <- sub("\\..*", "", rownames(counts))
+
+counts <- counts[, !uninteresting_samples]
+```
+
+```{r}
+# Check that rownames of annotation table are identical to count columns
+identical(rownames(sample_annot), colnames(counts))
+```
+```{r}
+# Create the deseq object
+dds <- DESeqDataSetFromMatrix(countData = as.matrix(counts),
+                              colData = sample_annot,
+                              design = ~ group)
+```
+
+
+```{r}
+# Do some suggested pre-filtering to counts for DESeq2
+# I.e. keep only features that have at least a count of 10 in at least 3 different samples. Normal samples 3 
+keep <- rowSums(counts(dds) >= 10) >= 3
+dds <- dds[keep, ]
+```
+
+```{r}
+# Explicitly set the reference level to match the normal group
+dds$group <- relevel(dds$group, ref = "Normal")
+```
+
+```{r}
+dds <- DESeq(dds)
+```
+
+
+```{r}
+dds_res <- as.data.frame(results(dds))
+```
+
+```{r}
+# Translate ensembl names to symbols
+edb <- EnsDb.Hsapiens.v86
+
+ens_to_gene <- ensembldb::select(edb, keys = rownames(dds_res),
+                      keytype = "GENEID",
+                      columns = c("GENEID", "GENENAME"))
+```
+
+```{r}
+dds_res_w_symbols <- merge.data.frame(dds_res, ens_to_gene,
+                                      by.x = 0, by.y = "GENEID")
+```
+
+```{r}
+
+dds_res_filt <- dds_res_w_symbols[abs(dds_res_w_symbols$log2FoldChange) > 1 & dds_res_w_symbols$padj < 0.05 & complete.cases(dds_res_w_symbols), ]
+```
+
+```{r}
+volcano_from_deseq_res <- function(res,
+                               #res_df_filt,
+                               annot_genes,
+                               title="STAND IN TITLE", 
+                               save=FALSE,
+                               specific_font="",
+                               label_size=3,
+                               text_size=11,
+                               remove_legend=FALSE,
+                               file_name_to_save=""
+                               ) {
+  print(annot_genes)
+  
+  res_df <- data.frame(res)
+  res_df$log_padj <- -log10(res_df$padj)
+  res_df$ensemble <- rownames(res_df)
+  
+  volc_res_df <- res_df
+  
+  volc_res_df %>%
+    mutate(status = case_when(
+      log2FoldChange >= 1 & padj <= 0.05 ~ "Up-regulated in FVM",
+      log2FoldChange <= -1 & padj <= 0.05 ~ "Down-regulated in FVM",
+      TRUE ~ "Not significant"
+    )) -> volc_res_df
+  
+  volc_p <- ggscatter(volc_res_df, x="log2FoldChange", y="log_padj",
+                      color = 'status',
+                      palette = c("blue","gray","red"),
+                      size=3, alpha=0.5, repel=TRUE,
+                      ylab="-log10(Adjusted p-value)",
+                      xlab="log2FoldChange") +
+    geom_hline(yintercept = 1.3, linetype="dashed") +
+    geom_vline(xintercept = c(-1, 1), linetype="dashed") +
+    ggtitle(title) +
+    xlim(-22, 22) + 
+    ylim(0, 40) +
+    theme(legend.position = c(0.85, 0.9),
+          legend.title = element_blank(),
+          legend.background = element_blank()) +
+    geom_label_repel(
+      data=subset(volc_res_df, (!is.na(GENENAME) &
+                                  GENENAME %in% annot_genes)),
+      aes(label=GENENAME),
+      size = label_size,
+      box.padding = unit(0.3, "lines"),
+      point.padding = unit(0.3, "lines"),
+      max.overlaps = Inf,
+      min.segment.length = 0,
+      family = specific_font,
+      fontface = 'italic'
+    )
+  
+  if (specific_font != "") {
+    volc_p <- volc_p +
+      theme(text = element_text(size = text_size,
+                                family = specific_font))
+  }
+  
+  if (remove_legend) {
+    volc_p <- volc_p + 
+      theme(legend.position = "none")
+  }
+  
+  if (save) {
+      ggsave(paste0(file_name_to_save, "_volcano", ".png"),
+               plot = volc_p, path = "volcano_plots",
+             width = 6, height = 4, dpi = 300)
+      ggsave(paste0(file_name_to_save, "_volcano", ".pdf"),
+               plot = volc_p, path = "volcano_plots",
+             width = 6, height = 4, dpi = 300)
+  }
+  
+  print(volc_p)
+}
+```
+
+### Figure 6A
+```{r}
+
+volc_fname <- str_glue("GSE102485_IGFBP7_MMRN2_CD93_FVM_vs_normal_retina_volcano_plot_{date_str}")
+
+volcano_from_deseq_res(dds_res_w_symbols, 
+                       annot_genes = c("IGFBP7", "MMRN2", "CD93"),
+                       title = "GSE102485 \nPDR FVM VS. Normal retina",
+                       save = FALSE,
+                       file_name_to_save = volc_fname)
+```
+
+
+### Write filtered result dataframe to excel
+```{r}
+write_xlsx(x = dds_res_filt,
+           path = "./tables/GSE102485_human_FVM_DR_bulk_RNA_filt_res_not_accounting_for_anatomy.xlsx")
+```
+
+### Supplementary table 8
+### Write unfiltered result dataframe to excel
+```{r}
+write_xlsx(x = dds_res_w_symbols,
+           path = "./tables/GSE102485_human_FVM_DR_bulk_RNA_unfilt_res_not_accounting_for_anatomy.xlsx", na = "NA")
+```
+
+
+### Boxplots of DESeq2 normalized counts
+```{r}
+# Copied from the bulk OIR script
+deseq_plotcounts_to_boxplot <- function(gene,
+                                        dds,
+                                        save=FALSE,
+                                        gene_name_db=ens_to_gene,
+                                        y_ax_lab_text_size=10,
+                                        y_ax_tick_text_size=10,
+                                        x_ax_text_size=10,
+                                        title_text_size=10) {
+  gene_symbol <- gene_name_db$GENEID[gene_name_db$GENENAME == gene]
+  count_data <- plotCounts(dds = dds,
+           gene = gene_symbol,
+           intgroup = c("group"),
+           main = "",
+           xlab = "Group",
+           returnData = TRUE)
+  #count_data <- count_data[grep("P17", count_data$simple_group), ]
+  #count_data$simple_group <- sub("P17", "", count_data$simple_group)
+  
+  box_p <- ggplot(count_data,
+       aes(x = group,
+           y = count,
+           fill = group),) + 
+  #scale_y_log10() + 
+  geom_boxplot(width = 0.3) +
+  ggtitle(gene) +
+  xlab("") +
+  ylab("Normalized count") +
+  theme_classic() + 
+  theme(legend.position = "none",
+        axis.title.y = element_text(
+          face = "bold", size = y_ax_lab_text_size
+        ),
+        axis.text.y = element_text(
+          size = y_ax_tick_text_size
+        ),
+        axis.text.x = element_text(
+          face = "bold", size = x_ax_text_size
+        ),
+        plot.title = element_text(
+          face = "bold.italic", size = title_text_size
+        )) + 
+    scale_x_discrete(labels = c("Disease" = "FVMs"))
+  
+  print(box_p)
+  
+  if (save) {
+    ggsave(paste0(gene, "_GSE102485_boxplot_", date_str, ".png"),
+               plot = box_p, path = "boxplots",
+             width = 4, height = 6, dpi = 300)
+    ggsave(paste0(gene, "_GSE102485_boxplot_", date_str, ".pdf"),
+                   plot = box_p, path = "boxplots",
+                 width = 4, height = 6, dpi = 300)
+  }
+}
+```
+
+### Figure 3C and supplementary figure S6A
+```{r}
+genes = c("POSTN", "PLVAP", "FOLR2", "CSF1", "CSF1R", "IL34", "GAS6", "MERTK", "CXCL12", "CXCR4", "NOTCH3", "DLL4", "ADGRE5", "CD55")
+
+for (gene in genes) {
+  deseq_plotcounts_to_boxplot(gene = gene,
+                            dds = dds,
+                            save = TRUE,
+                            y_ax_lab_text_size = 15,
+                            y_ax_tick_text_size = 12,
+                            x_ax_text_size = 15,
+                            title_text_size = 20)
+}
+```

@@ -1,0 +1,304 @@
+### Imports
+
+```{r}
+library("stringr")
+library("DESeq2")
+library("org.Mm.eg.db")
+library("dplyr")
+library("ggplot2")
+library("ggrepel")
+library("ggpubr")
+library("writexl")
+library("readxl")
+library("tidyverse")
+```
+
+```{r}
+date_str <- format(Sys.Date(), "%Y%m%d")
+date_str
+
+set.seed(42)
+```
+
+```{r}
+# List files
+filenames <- list.files("../GSE158799_count_excels", full.names = TRUE)
+```
+
+
+```{r}
+# Drop P30
+filenames <- filenames[-grep("P30", filenames)]
+```
+
+```{r}
+counts_list <- list()
+
+for (fname in filenames) {
+  info <- read_excel(fname, col_names = TRUE)
+  counts_list[[fname]] <- info
+}
+```
+
+```{r}
+combined_counts <- counts_list %>% reduce(left_join, by = "Gene")
+combined_counts <- as.data.frame(combined_counts)
+rownames(combined_counts) <- combined_counts$Gene
+combined_counts$Gene <- NULL
+```
+
+```{r}
+# Create an annotation table
+annot_rows <- colnames(combined_counts)
+
+# Only P14 and P17 contained samples were kept
+p14_samples_idx <- grep("P14", annot_rows)
+p17_samples_idx <- grep("P17", annot_rows)
+
+annot_days <- rep("P17", length(annot_rows))
+annot_days[p14_samples_idx] <- "P14"
+
+OIR_samples <- grep("OIR", annot_rows)
+
+annot_groups <- rep("Normal", length(annot_rows))
+annot_groups[OIR_samples] <- "OIR"
+
+annot_table <- data.frame("Timepoint" = annot_days,
+                          "Group" = annot_groups,
+                          row.names = annot_rows,
+                          stringsAsFactors = TRUE)
+```
+
+```{r}
+# Check that annot rows and count cols match
+identical(rownames(annot_table), colnames(combined_counts))
+```
+
+```{r}
+dds <- DESeqDataSetFromMatrix(countData = combined_counts,
+                              colData = annot_table,
+                              design = ~ Timepoint + Group + Timepoint:Group)
+```
+
+```{r}
+# Suggested pre-filtering by DESeq2 vignette, smallest sample group is 2
+keep <- rowSums(counts(dds) >= 10) >= 2
+dds <- dds[keep,]
+
+```
+
+
+```{r}
+# Explicit factor reference levels
+dds$Timepoint <- relevel(dds$Timepoint, ref = "P14")
+dds$Group <- relevel(dds$Group, ref = "Normal")
+```
+
+```{r}
+dds <- DESeq(dds)
+```
+
+```{r}
+resultsNames(dds)
+```
+```{r}
+# P14 OIR vs Normal, with normal ref
+p14_res <- as.data.frame(results(dds,
+                                 contrast = c("Group", "OIR", "Normal")))
+```
+
+```{r}
+p17_res <- as.data.frame(results(dds,
+                                 contrast = list(
+                                   c("Group_OIR_vs_Normal",
+                                     "TimepointP17.GroupOIR")
+                                 )))
+```
+
+```{r}
+# Design construction
+dds$simple_group <- factor(paste0(dds$Timepoint, dds$Group))
+design(dds) <- ~ simple_group
+dds <- DESeq(dds)
+resultsNames(dds)
+```
+```{r}
+p14_res_simple <- as.data.frame(results(dds, 
+                                 contrast = c("simple_group",
+                                              "P14OIR", "P14Normal")))
+```
+
+```{r}
+p17_res_simple <- as.data.frame(results(dds, 
+                                 contrast = c("simple_group",
+                                              "P17OIR", "P17Normal")))
+```
+
+```{r}
+P14_res_filt <- p14_res_simple[abs(p14_res_simple$log2FoldChange) > 1 & p14_res_simple$padj < 0.05 & complete.cases(p14_res_simple), ]
+P14_res_filt["gene"] <- rownames(P14_res_filt)
+```
+
+```{r}
+P17_res_filt <- p17_res_simple[abs(p17_res_simple$log2FoldChange) > 1 & p17_res_simple$padj < 0.05 & complete.cases(p17_res_simple), ]
+P17_res_filt["gene"] <- rownames(P17_res_filt)
+```
+
+```{r}
+write_xlsx(list("P14 OIR Bulk RNA filtered" = P14_res_filt,
+                "P17 OIR Bulk RNA filtered" = P17_res_filt),
+           path = "./OIR_Bulk_RNAseq_DEGs_20261030.xlsx")
+```
+
+```{r}
+# Add genes as its own column since writexl doesn't seem to provide a way to preserve it
+p14_res_simple["gene"] <- rownames(p14_res_simple)
+p17_res_simple["gene"] <- rownames(p17_res_simple)
+```
+
+### Supplementary table 7
+```{r}
+write_xlsx(list("P14 OIR Bulk RNA unfiltered" = p14_res_simple,
+                "P17 OIR Bulk RNA unfiltered" = p17_res_simple),
+           path = str_glue("./OIR_Bulk_RNAseq_unfiltered_DEGs_{date_str}.xlsx"), na = "NA")
+```
+
+
+```{r}
+genes_of_interest <- c("Cd93", "Igfbp7", "Mmrn2")
+
+for (gene in genes_of_interest) {
+  
+  main_title <- str_glue("GSE158799 - {gene}")
+  
+  plotCounts(dds = dds,
+           gene = gene,
+           intgroup = c("simple_group"),
+           main = main_title,
+           xlab = "Group")
+}
+
+
+```
+```{r}
+gene <- "Mmrn2"
+
+test <- plotCounts(dds = dds,
+           gene = gene,
+           intgroup = c("simple_group"),
+           main = main_title,
+           xlab = "Group",
+           returnData = TRUE)
+test <- test[grep("P17", test$simple_group), ]
+test$simple_group <- sub("P17", "", test$simple_group)
+
+box_p <- ggplot(test,
+       aes(x = simple_group,
+           y = log2(count + 0.5),
+           fill = simple_group),) + 
+  #scale_y_log10() + 
+  geom_boxplot(width = 0.3) +
+  ggtitle(gene) +
+  xlab("") +
+  ylab("Log2 normalized count") +
+  theme_classic() + 
+  theme(legend.position = "none",
+        axis.title.y = element_text(
+          face = "bold"
+        ),
+        axis.text.x = element_text(
+          face = "bold"
+        ),
+        plot.title = element_text(
+          face = "bold.italic"
+        ))
+
+ggsave(paste0(gene, "_GSE158799_P17_boxplot_", date_str, ".png"),
+               plot = box_p, path = "boxplots",
+             width = 4, height = 6, dpi = 300)
+ggsave(paste0(gene, "_GSE158799_P17_boxplot_", date_str, ".pdf"),
+               plot = box_p, path = "boxplots",
+             width = 4, height = 6, dpi = 300)
+```
+
+```{r}
+deseq_plotcounts_to_boxplot <- function(gene,
+                                        dds,
+                                        save=FALSE,
+                                        y_ax_lab_text_size=10,
+                                        y_ax_tick_text_size=10,
+                                        x_ax_text_size=10,
+                                        title_text_size=10,
+                                        timepoint="P17",
+                                        ylim_up=1000) {
+  
+  if (gene %in% rownames(dds) == FALSE) {
+    print(paste0(gene, " not present."))
+    return(NULL)
+  }
+  count_data <- plotCounts(dds = dds,
+           gene = gene,
+           intgroup = c("simple_group"),
+           main = main_title,
+           xlab = "Group",
+           returnData = TRUE)
+  count_data <- count_data[grep(timepoint, count_data$simple_group), ]
+  count_data$simple_group <- sub(timepoint, "", count_data$simple_group)
+  
+  box_p <- ggplot(count_data,
+       aes(x = simple_group,
+           y = count,
+           fill = simple_group),) + 
+  #scale_y_log10() + 
+  geom_boxplot(width = 0.3) +
+  ggtitle(paste0(gene, " ", timepoint)) +
+  xlab("") +
+  ylab("Normalized count") +
+  theme_classic() + 
+  theme(legend.position = "none",
+        axis.title.y = element_text(
+          face = "bold", size = y_ax_lab_text_size
+        ),
+        axis.text.y = element_text(
+          size = y_ax_tick_text_size
+        ),
+        axis.text.x = element_text(
+          face = "bold", size = x_ax_text_size
+        ),
+        plot.title = element_text(
+          face = "bold.italic", size = title_text_size
+        ))
+  
+  if (ylim_up != 1000) {
+    box_p <- box_p + ylim(0, ylim_up)
+  }
+  
+  print(box_p)
+  
+  if (save) {
+    ggsave(paste0(gene, "_GSE158799_boxplot_", timepoint, "_", date_str, ".png"),
+               plot = box_p, path = "boxplots",
+             width = 4, height = 6, dpi = 300)
+    ggsave(paste0(gene, "_GSE158799_boxplot_", timepoint, "_", date_str, ".pdf"),
+                   plot = box_p, path = "boxplots",
+                 width = 4, height = 6, dpi = 300)
+  }
+}
+```
+
+### Figure 7B
+
+```{r}
+
+for (gene in genes_of_interest) {
+  deseq_plotcounts_to_boxplot(gene = gene,
+                            dds = dds,
+                            save = TRUE,
+                            y_ax_lab_text_size = 15,
+                            y_ax_tick_text_size = 12,
+                            x_ax_text_size = 15,
+                            title_text_size = 20)
+}
+
+
+```
