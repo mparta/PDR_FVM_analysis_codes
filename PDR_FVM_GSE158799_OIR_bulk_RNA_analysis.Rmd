@@ -156,7 +156,7 @@ p14_res_simple["gene"] <- rownames(p14_res_simple)
 p17_res_simple["gene"] <- rownames(p17_res_simple)
 ```
 
-### Supplementary table 7
+### Supplementary table 9
 ```{r}
 write_xlsx(list("P14 OIR Bulk RNA unfiltered" = p14_res_simple,
                 "P17 OIR Bulk RNA unfiltered" = p17_res_simple),
